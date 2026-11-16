@@ -23,7 +23,7 @@ import psutil
 import psycopg
 
 from epb.load import PG_DSN
-from epb.paths import DUCK_WALK, Params, Seed, duck_prune_query, pg_sql
+from epb.paths import DUCK_WALK, Params, Seed, duck_prune_query, pg_sql, prune_predicate
 
 
 # --------------------------------------------------------------------------- sampling
@@ -429,9 +429,148 @@ def run_funnel(d: Path, params: Params, out: Path) -> None:
                 print(f"    {k:20} {med(vals):>14,.1f} {p95(vals):>14,.1f}")
 
 
+# --------------------------------------------------------------------------- scenario F
+
+WALK_SUMMARY_TAIL = """,
+agg AS (SELECT node, min(hops) AS h, min(arr) AS a FROM walk GROUP BY node)
+SELECT (SELECT count(*) - 1 FROM walk), (SELECT count(*) - 1 FROM agg),
+       (SELECT {list_agg} FROM (SELECT node, h, a FROM agg ORDER BY a, node LIMIT 50) x)"""
+
+
+def pg_bundle_sql(s: Seed, p: Params) -> tuple[str, str]:
+    walk = pg_sql(s, p, True).split("\nSELECT count(*) - 1")[0]
+    q1 = walk + WALK_SUMMARY_TAIL.format(list_agg="json_agg(json_build_array(node, h, a))")
+    q2 = (f"SELECT src, count(*) FROM edges WHERE {prune_predicate(s, p)} "
+          f"GROUP BY src ORDER BY 2 DESC, src LIMIT 20")
+    return q1, q2
+
+
+DUCK_BUNDLE_WALK = DUCK_WALK.split("\nSELECT count(*) - 1")[0] + WALK_SUMMARY_TAIL.format(
+    list_agg="list([node, h, a])")
+DUCK_BUNDLE_STATS = "SELECT src, count(*) FROM pe GROUP BY src ORDER BY 2 DESC, src LIMIT 20"
+
+
+def run_f(d: Path, params: Params, out: Path, levels: list[int], dur_s: int, rate: int, batch: int,
+          rounds: int, timeout_s: int) -> None:
+    """Concurrent alerts (path search + candidate statistics) under steady ingest."""
+    import gzip
+    import random
+    seeds, _ = load_seeds(d)
+    lines = []
+    with gzip.open(next(d.glob("records-*.ndjson.gz")), "rt") as f:
+        for i, line in enumerate(f):
+            if i >= 200_000:
+                break
+            lines.append(line.rstrip("\n"))
+    ing = psycopg.connect(PG_DSN, autocommit=True)
+    ing.execute("DROP TABLE IF EXISTS records; CREATE TABLE records (id BIGSERIAL PRIMARY KEY, rec JSONB NOT NULL)")
+    stop_ing = threading.Event()
+    lat: list[tuple[float, float]] = []
+
+    def ingest() -> None:
+        pos, interval, nxt = 0, batch / rate, time.perf_counter()
+        while not stop_ing.is_set():
+            t = time.perf_counter()
+            with ing.cursor().copy("COPY records (rec) FROM STDIN") as cp:
+                for k in range(batch):
+                    cp.write_row((lines[(pos + k) % len(lines)],))
+            lat.append((time.time(), time.perf_counter() - t))
+            pos += batch
+            nxt += interval
+            time.sleep(max(0.0, nxt - time.perf_counter()))
+
+    duckdb_db = duckdb.connect()
+    duckdb_db.execute("SET threads = 4; SET memory_limit = '3GB'; INSTALL postgres; LOAD postgres")
+    duckdb_db.execute(f"ATTACH '{PG_DSN}' AS pg (TYPE postgres, READ_ONLY)")
+    me = psutil.Process(os.getpid())
+    pgmem, procmem = ContainerMem("epb-pg-1"), ProcMem()
+    th = threading.Thread(target=ingest, daemon=True)
+    th.start()
+    time.sleep(5)
+    results = []
+    with out.open("w") as f:
+        for rnd in range(rounds):
+            for n in levels:
+                for approach in (["B", "C"] if rnd % 2 == 0 else ["C", "B"]):
+                    stop = threading.Event()
+                    done: list[dict] = []
+                    lock = threading.Lock()
+
+                    def worker(wid: int) -> None:
+                        rng = random.Random(wid * 7919 + n)
+                        if approach == "B":
+                            conn = psycopg.connect(PG_DSN, autocommit=True)
+                            conn.execute(f"SET statement_timeout = '{timeout_s}s'")
+                        else:
+                            conn = duckdb_db.cursor()
+                        while not stop.is_set():
+                            s = seeds[rng.randrange(len(seeds))]
+                            t = time.perf_counter()
+                            rec = {"seed": s.seed, "ok": True}
+                            try:
+                                if approach == "B":
+                                    q1, q2 = pg_bundle_sql(s, params)
+                                    rec["paths"] = conn.execute(q1).fetchone()[0]
+                                    conn.execute(q2).fetchall()
+                                else:
+                                    conn.execute("CREATE OR REPLACE TEMP TABLE pe AS SELECT * FROM postgres_query('pg', $q)",
+                                                 {"q": duck_prune_query(s, params)})
+                                    rec["paths"] = conn.execute(
+                                        DUCK_BUNDLE_WALK, {"seed": s.seed, "a0": s.a0, "hops": params.hops}).fetchone()[0]
+                                    conn.execute(DUCK_BUNDLE_STATS).fetchall()
+                            except Exception as e:
+                                rec.update(ok=False, error=f"{type(e).__name__}: {str(e).splitlines()[0][:100]}")
+                            rec["seconds"] = time.perf_counter() - t
+                            with lock:
+                                done.append(rec)
+                        conn.close()
+
+                    pgmem.reset()
+                    procmem.start()
+                    temp0 = pg_temp_bytes(ing)
+                    cpu_pg0, cpu_app0 = cgroup_cpu_usec("epb-pg-1"), sum(me.cpu_times()[:2])
+                    t0 = time.time()
+                    ws = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+                    for w in ws:
+                        w.start()
+                    time.sleep(dur_s)
+                    stop.set()
+                    for w in ws:
+                        w.join()
+                    t1 = time.time()
+                    ing.execute("SELECT pg_stat_force_next_flush()")
+                    ok = sorted(r["seconds"] for r in done if r["ok"])
+                    ls = sorted(l for (w, l) in lat if t0 <= w < t1)
+                    pick = lambda xs, q: xs[int(q * (len(xs) - 1))] if xs else float("nan")
+                    r = {"scenario": f"F-{approach}", "round": rnd, "workers": n, "wall_s": t1 - t0,
+                         "bundles": len(done), "ok": len(ok), "errors": len(done) - len(ok),
+                         "bundles_per_s": len(ok) / (t1 - t0),
+                         "lat_p50_s": pick(ok, .5), "lat_p95_s": pick(ok, .95), "lat_max_s": ok[-1] if ok else None,
+                         "pg_cores": (cgroup_cpu_usec("epb-pg-1") - cpu_pg0) / 1e6 / (t1 - t0),
+                         "app_cores": (sum(me.cpu_times()[:2]) - cpu_app0) / (t1 - t0),
+                         "pg_anon_peak_mb": pgmem.get() / 2**20, "app_rss_peak_mb": procmem.stop() / 2**20,
+                         "pg_temp_mb": (pg_temp_bytes(ing) - temp0) / 2**20,
+                         "ingest_rows_per_s": len(ls) * batch / (t1 - t0),
+                         "ingest_p50_ms": 1000 * pick(ls, .5), "ingest_p95_ms": 1000 * pick(ls, .95),
+                         "ingest_p99_ms": 1000 * pick(ls, .99),
+                         "error_kinds": sorted({x["error"] for x in done if not x["ok"]})[:3]}
+                    f.write(json.dumps(r) + "\n")
+                    f.flush()
+                    results.append(r)
+                    print(f"{r['scenario']} w={n:2d} ok={r['ok']:5d} err={r['errors']:3d} {r['bundles_per_s']:6.1f}/s "
+                          f"p50={r['lat_p50_s']:.3f} p95={r['lat_p95_s']:.3f} pg_cores={r['pg_cores']:.2f} "
+                          f"app_cores={r['app_cores']:.2f} temp={r['pg_temp_mb']:.0f}MB "
+                          f"ingest p95={r['ingest_p95_ms']:.0f} p99={r['ingest_p99_ms']:.0f}ms", flush=True)
+                    time.sleep(5)
+    stop_ing.set()
+    th.join()
+    pgmem.close()
+    ing.execute("DROP TABLE records")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("scenario", choices=["abc", "d", "e", "funnel"])
+    ap.add_argument("scenario", choices=["abc", "d", "e", "funnel", "f"])
     ap.add_argument("data")
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--hops", type=int, default=6)
@@ -449,6 +588,9 @@ def main() -> None:
     if a.scenario == "abc":
         rows = run_abc(Path(a.data), a.reps, params, a.timeout, out, a.only.split(","))
         summarize(rows)
+    elif a.scenario == "f":
+        run_f(Path(a.data), params, out, levels=[1, 4, 8, 16], dur_s=60, rate=10_000, batch=2_000,
+              rounds=a.reps, timeout_s=a.timeout)
     elif a.scenario == "funnel":
         run_funnel(Path(a.data), params, out)
     elif a.scenario == "d":
