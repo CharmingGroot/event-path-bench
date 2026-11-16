@@ -1,0 +1,67 @@
+# PostgreSQL and Neo4j for the benchmark. The runner (Python, embedded DuckDB)
+# runs on the host. Memory limits fit a Docker VM of about 8 GB; the two
+# databases run at the same time only for the dual-write scenario.
+name: epb
+
+services:
+  pg:
+    image: postgres:17.12
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    command:
+      - postgres
+      - -c
+      - shared_buffers=768MB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - effective_cache_size=2GB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /archive/%f && cp %p /archive/%f
+      - -c
+      - max_parallel_workers_per_gather=2
+      - -c
+      - jit=off
+      - -c
+      - temp_file_limit=5GB
+    shm_size: 1g
+    mem_limit: 3g
+    cpus: 4
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - pgarchive:/archive
+    entrypoint: ["sh", "-c", "chown postgres:postgres /archive && exec docker-entrypoint.sh \"$$@\"", "--"]
+
+  neo4j:
+    image: neo4j:2026.10.2-community
+    environment:
+      NEO4J_AUTH: neo4j/benchbench
+      NEO4J_server_memory_heap_initial__size: 1600m
+      NEO4J_server_memory_heap_max__size: 1600m
+      NEO4J_server_memory_pagecache_size: 1600m
+      NEO4J_db_memory_transaction_total_max: 1200m
+    mem_limit: 4g
+    cpus: 4
+    ports:
+      - "127.0.0.1:57474:7474"
+      - "127.0.0.1:57687:7687"
+    volumes:
+      - neo4jdata:/data
+      - ./data/import:/import
+
+volumes:
+  pgdata:
+  pgarchive:
+  neo4jdata:

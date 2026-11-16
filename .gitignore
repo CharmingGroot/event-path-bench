@@ -6,3 +6,5 @@ results/raw/
 *.duckdb
 .env
 *.log
+data/*/tmp/
+results/*.log

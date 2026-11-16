@@ -28,6 +28,7 @@ LINEAGE_MAX = 3600 * S   # process lineage, file written then executed
 HOUR = 3600 * S
 FOLD_BUCKET = 600 * S
 REFL_MIN = 3             # connections per hour in both directions
+STATIC_HUB = 1000        # anchor events per hour above which the anchor counts as a hub
 
 RULES = {"same_host": 1, "same_session": 2, "same_user": 4, "lineage": 8,
          "file_exec": 16, "net_conn": 32, "same_dst": 64}
@@ -180,6 +181,13 @@ SELECT src, dst, bit_or(rule)::SMALLINT AS rules, min(anchor_cnt)::INT AS anchor
   bool_and(refl) AS refl, min(fold_rank)::INT AS fold_rank,
   any_value(t_start) AS t_start, any_value(t_end) AS t_end
 FROM inst2 GROUP BY src, dst;
+
+-- per-node fan-out order among edges that pass the static filters (hub, reflection,
+-- folding); search follows only the first K edges of each node by start time
+CREATE OR REPLACE TABLE edges AS
+SELECT *, CASE WHEN keep THEN row_number() OVER (PARTITION BY src, keep ORDER BY t_start, dst) END::INT AS out_rank
+FROM (SELECT *, (anchor_cnt <= {STATIC_HUB} AND NOT refl AND fold_rank = 1) AS keep FROM edges);
+ALTER TABLE edges DROP COLUMN keep;
 """
 
 SEEDS_SQL = """
@@ -197,10 +205,12 @@ JOIN events e ON e.corr = x.corr;
 """
 
 
-def run(data_dir: str, threads: int = 8, memory: str = "6GB") -> None:
+def run(data_dir: str, threads: int = 4, memory: str = "3GB") -> None:
     d = Path(data_dir)
-    con = duckdb.connect(str(d / "derive.duckdb"))
+    con = duckdb.connect()  # in memory; only the parquet output is kept
+    (d / "tmp").mkdir(exist_ok=True)
     con.execute(f"SET threads = {threads}; SET memory_limit = '{memory}'; SET preserve_insertion_order = true")
+    con.execute(f"SET temp_directory = '{d / 'tmp'}'; SET max_temp_directory_size = '5GB'")
     steps = [
         ("events", EVENTS_SQL.format(glob=str(d / "records-*.ndjson.gz"))),
         ("edges", EDGES_SQL),
@@ -225,7 +235,6 @@ def run(data_dir: str, threads: int = 8, memory: str = "6GB") -> None:
     con.execute(f"COPY anchor_counts TO '{out}/anchor_counts.parquet'")
     con.execute(f"COPY alerts TO '{out}/alerts.parquet'")
     con.execute(f"COPY truth TO '{out}/truth.parquet'")
-    con.execute("DROP TABLE rec; DROP TABLE inst; DROP TABLE inst2")
     con.close()
 
 
