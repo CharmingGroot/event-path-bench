@@ -1,0 +1,14 @@
+[project]
+name = "event-path-bench"
+version = "0.0.1"
+description = "Benchmark for multi-hop relationship path search over OCSF security events"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "duckdb>=1.4",
+    "psycopg[binary]>=3.2",
+    "neo4j>=5.28",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
